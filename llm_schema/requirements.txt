@@ -5,3 +5,4 @@ numpy>=1.26,<3.0
 pyarrow>=15.0,<25.0
 python-dotenv>=1.0,<2.0
 pytest>=8.0,<10.0
+litellm>=1.80,<2.0

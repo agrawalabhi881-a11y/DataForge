@@ -62,12 +62,22 @@ def test_duplicate_field_names_are_rejected():
 
 def test_incomplete_parse_result():
     result = SpecificationParseResult(
+        partial_requirements={
+            "domain": "phishing_urls",
+            "fields": [
+                {"name": "url"},
+                {"name": "domain"},
+            ],
+        },
         missing_fields=["target_records"],
         clarification_questions=["How many records do you need?"],
     )
 
     assert result.is_complete is False
-    assert "target_records" in result.missing_fields
+    assert result.specification is None
+    assert result.partial_requirements.domain == "phishing_urls"
+    assert len(result.partial_requirements.fields) == 2
+    assert result.missing_fields == ["target_records"]
 
 
 def test_complete_parse_result():
