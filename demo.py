@@ -148,7 +148,7 @@ def run_demo(user_request: str) -> int:
 
 
 def main() -> int:
-    _print_section("DATAFORGE | PERSON 3")
+    _print_section("DATAFORGE ")
     print("LLM REQUIREMENT PARSING & SCHEMA MAPPING")
     print("\nEnter one dataset requirement in natural language.")
     try:
