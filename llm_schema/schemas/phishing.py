@@ -21,6 +21,9 @@ class PhishingURLRecord(CanonicalRecord):
     path_depth: int | None = Field(default=None, ge=0)
 
     https: bool | None = None
+    has_ip_address: bool | None = None
+    # Number of literal dot characters in the URL; distinct from subdomain_count.
+    dot_count: int | None = Field(default=None, ge=0)
     entropy: float | None = Field(default=None, ge=0)
 
     # Preserve source labels instead of forcing a fixed vocabulary.
