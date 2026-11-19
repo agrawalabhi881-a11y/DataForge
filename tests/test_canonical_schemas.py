@@ -2,10 +2,13 @@ import pytest
 from pydantic import ValidationError
 
 from llm_schema.schemas import (
+    DatasetDomain,
     PhishingURLRecord,
     AttackLogRecord,
     VulnerableCodeRecord,
     UserBehaviorRecord,
+    get_schema_for_domain,
+    SCHEMA_REGISTRY,
 )
 
 
@@ -67,3 +70,22 @@ def test_invalid_anomaly_score():
             event_id="U002",
             anomaly_score=1.5,
         )
+
+
+def test_schema_registry_covers_every_domain_with_expected_models():
+    expected = {
+        DatasetDomain.PHISHING_URLS: PhishingURLRecord,
+        DatasetDomain.ATTACK_LOGS: AttackLogRecord,
+        DatasetDomain.VULNERABLE_CODE: VulnerableCodeRecord,
+        DatasetDomain.USER_BEHAVIOR: UserBehaviorRecord,
+    }
+    assert set(SCHEMA_REGISTRY) == set(DatasetDomain)
+    assert dict(SCHEMA_REGISTRY) == expected
+    for domain, model in expected.items():
+        assert get_schema_for_domain(domain) is model
+        assert get_schema_for_domain(domain.value) is model
+
+
+def test_schema_registry_rejects_external_mutation():
+    with pytest.raises(TypeError):
+        SCHEMA_REGISTRY[DatasetDomain.ATTACK_LOGS] = PhishingURLRecord

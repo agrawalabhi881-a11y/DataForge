@@ -2,12 +2,25 @@
 from __future__ import annotations
 
 import json
+import io
+import itertools
+import math
 import re
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+)
 
 from llm_schema.schemas import DatasetDomain, get_schema_for_domain
 
@@ -22,8 +35,11 @@ class ColumnProfile(BaseModel):
 class DatasetProfile(BaseModel):
     path: str
     format: str
+    # Legacy field: number of rows inspected, never the dataset total.
     row_count: int | None = None
     columns: list[ColumnProfile]
+    total_row_count: int | None = None
+    sampled_row_count: int | None = None
 
 
 class FieldMapping(BaseModel):
@@ -49,19 +65,27 @@ class FieldCompatibility(BaseModel):
     reason: str | None = None
 
 
+class MappingIssue(BaseModel):
+    source: str
+    target: str
+    reason: str
+
+
 class CompatibilityReport(BaseModel):
     matched: list[FieldCompatibility]
     missing: list[str]
     extra: list[str]
     incompatible: list[FieldCompatibility]
+    indeterminate: list[FieldCompatibility] = Field(default_factory=list)
+    invalid_mappings: list[MappingIssue] = Field(default_factory=list)
 
 
 class LabelMapping(BaseModel):
     """Explicit label conversion; each item retains its original source value."""
     model_config = ConfigDict(extra="forbid")
 
-    source_label: str
-    canonical_label: str
+    source_label: StrictStr | StrictInt | StrictFloat | StrictBool
+    canonical_label: StrictStr
 
 
 LABEL_ALIASES: dict[str, set[str]] = {
@@ -99,22 +123,99 @@ def _normalize(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.casefold())
 
 
+def _iter_json_array(stream: io.TextIOBase) -> Iterator[Any]:
+    """Yield top-level JSON array items incrementally using the stdlib decoder."""
+    decoder = json.JSONDecoder()
+    buffer = stream.read(65536)
+    position = 0
+    eof = not buffer
+
+    def refill() -> None:
+        nonlocal buffer, position, eof
+        remaining = buffer[position:]
+        chunk = stream.read(65536)
+        buffer = remaining + chunk
+        position = 0
+        eof = not chunk
+
+    def skip_whitespace() -> None:
+        nonlocal position
+        while True:
+            while position < len(buffer) and buffer[position].isspace():
+                position += 1
+            if position < len(buffer) or eof:
+                return
+            refill()
+
+    skip_whitespace()
+    if position >= len(buffer) or buffer[position] != "[":
+        raise ValueError("Expected a JSON record array")
+    position += 1
+    first = True
+
+    while True:
+        skip_whitespace()
+        if position >= len(buffer):
+            raise ValueError("Unterminated JSON record array")
+        if buffer[position] == "]":
+            return
+        if not first:
+            if buffer[position] != ",":
+                raise ValueError("Expected a comma between JSON records")
+            position += 1
+            skip_whitespace()
+        while True:
+            try:
+                item, end = decoder.raw_decode(buffer, position)
+                position = end
+                break
+            except json.JSONDecodeError:
+                if eof:
+                    raise
+                refill()
+        yield item
+        first = False
+
+
+def _read_json_array_sample(path: Path, sample_size: int) -> pd.DataFrame:
+    with path.open("r", encoding="utf-8") as stream:
+        records = list(itertools.islice(_iter_json_array(stream), sample_size))
+    return pd.DataFrame(records)
+
+
 def inspect_dataset(path: str | Path, sample_size: int = 100) -> DatasetProfile:
-    """Inspect CSV, JSON/JSONL, or Parquet column names, types, and sample values."""
+    """Inspect a bounded sample; types and nullability describe inspected rows only."""
     file_path = Path(path)
     suffix = file_path.suffix.casefold()
     if sample_size < 1:
         raise ValueError("sample_size must be positive")
+    total_row_count = None
     if suffix == ".csv":
         frame = pd.read_csv(file_path, nrows=sample_size)
-    elif suffix in {".json", ".jsonl", ".ndjson"}:
-        try:
-            frame = pd.read_json(file_path, lines=suffix in {".jsonl", ".ndjson"})
-        except ValueError:
-            frame = pd.read_json(file_path, lines=True)
-        frame = frame.head(sample_size)
+    elif suffix in {".jsonl", ".ndjson"}:
+        chunks = pd.read_json(file_path, lines=True, chunksize=sample_size)
+        frame = next(chunks, pd.DataFrame())
+    elif suffix == ".json":
+        with file_path.open("r", encoding="utf-8") as stream:
+            while True:
+                first_character = stream.read(1)
+                if not first_character:
+                    raise ValueError("JSON dataset is empty")
+                if not first_character.isspace():
+                    break
+        if first_character == "[":
+            frame = _read_json_array_sample(file_path, sample_size)
+        else:
+            # Preserve support for pandas' object-oriented JSON formats.
+            frame = pd.read_json(file_path).head(sample_size)
     elif suffix in {".parquet", ".pq"}:
-        frame = pd.read_parquet(file_path).head(sample_size)
+        import pyarrow.parquet as parquet
+
+        parquet_file = parquet.ParquetFile(file_path)
+        metadata = parquet_file.metadata
+        total_row_count = metadata.num_rows if metadata is not None else None
+        batch = next(parquet_file.iter_batches(batch_size=sample_size), None)
+        frame = batch.to_pandas() if batch is not None else pd.DataFrame(columns=parquet_file.schema_arrow.names)
     else:
         raise ValueError(f"Unsupported dataset format: {suffix or '(no extension)'}")
     profiles = []
@@ -122,46 +223,121 @@ def inspect_dataset(path: str | Path, sample_size: int = 100) -> DatasetProfile:
         series = frame[name]
         values = [str(value)[:160] for value in series.dropna().head(3).tolist()]
         profiles.append(ColumnProfile(name=str(name), data_type=str(series.dtype), nullable=bool(series.isna().any()), samples=values))
-    return DatasetProfile(path=str(file_path), format=suffix.lstrip("."), row_count=len(frame), columns=profiles)
+    sampled_row_count = len(frame)
+    return DatasetProfile(
+        path=str(file_path),
+        format=suffix.lstrip("."),
+        row_count=sampled_row_count,
+        total_row_count=total_row_count,
+        sampled_row_count=sampled_row_count,
+        columns=profiles,
+    )
 
 
 def deterministic_mapping(profile: DatasetProfile, domain: DatasetDomain | str) -> MappingResult:
     model = get_schema_for_domain(domain)
-    fields = set(model.model_fields)
-    normalized_fields: dict[str, list[str]] = {}
+    fields = list(model.model_fields)
+    canonical_by_name = {_normalize(field): field for field in fields}
+    aliases_by_name: dict[str, list[str]] = {}
     for field in fields:
-        normalized_fields.setdefault(_normalize(field), []).append(field)
-        for alias in LABEL_ALIASES.get(field, set()):
-            normalized_fields.setdefault(_normalize(alias), []).append(field)
-    mappings, ambiguous, unmapped = [], {}, []
-    used_targets: set[str] = set()
+        for alias in sorted(LABEL_ALIASES.get(field, set())):
+            aliases_by_name.setdefault(_normalize(alias), []).append(field)
+    for targets in aliases_by_name.values():
+        targets.sort()
+
+    columns_by_name: dict[str, list[ColumnProfile]] = {}
     for column in profile.columns:
-        targets = list(dict.fromkeys(normalized_fields.get(_normalize(column.name), [])))
-        targets = [target for target in targets if target not in used_targets]
-        if len(targets) == 1:
-            exact = _normalize(column.name) == _normalize(targets[0])
-            mappings.append(FieldMapping(source=column.name, target=targets[0], confidence=1.0 if exact else 0.9))
-            used_targets.add(targets[0])
-        elif len(targets) > 1:
-            ambiguous[column.name] = targets
+        columns_by_name.setdefault(_normalize(column.name), []).append(column)
+
+    mappings: list[FieldMapping] = []
+    ambiguous: dict[str, list[str]] = {}
+    unmapped: list[str] = []
+    reserved_targets = {
+        canonical_by_name[name]
+        for name in columns_by_name
+        if name in canonical_by_name
+    }
+    assigned_targets: set[str] = set()
+
+    # Canonical names claim their targets before any aliases, independent of
+    # source column ordering. Normalization collisions are left unresolved.
+    for normalized_name in sorted(columns_by_name):
+        columns = sorted(columns_by_name[normalized_name], key=lambda item: item.name)
+        target = canonical_by_name.get(normalized_name)
+        if target is None:
+            continue
+        if len(columns) != 1:
+            unmapped.extend(column.name for column in columns)
+            continue
+        mappings.append(FieldMapping(source=columns[0].name, target=target, confidence=1.0))
+        assigned_targets.add(target)
+
+    alias_claims: dict[str, list[tuple[ColumnProfile, list[str]]]] = {}
+    for normalized_name in sorted(columns_by_name):
+        if normalized_name in canonical_by_name:
+            continue
+        columns = sorted(columns_by_name[normalized_name], key=lambda item: item.name)
+        targets = [target for target in aliases_by_name.get(normalized_name, []) if target not in reserved_targets]
+        targets = sorted(set(targets))
+        if not targets:
+            unmapped.extend(column.name for column in columns)
+            continue
+        if len(columns) > 1:
+            for column in columns:
+                ambiguous[column.name] = targets
+            continue
+        alias_claims.setdefault(targets[0] if len(targets) == 1 else "", []).append((columns[0], targets))
+
+    # A canonical target claimed by multiple aliases remains ambiguous instead
+    # of being awarded to whichever source column happened to appear first.
+    claims_by_target: dict[str, list[ColumnProfile]] = {}
+    for claimed_target, claims in alias_claims.items():
+        if claimed_target:
+            claims_by_target.setdefault(claimed_target, []).extend(column for column, _ in claims)
         else:
-            unmapped.append(column.name)
+            for column, targets in claims:
+                ambiguous[column.name] = targets
+
+    for target in sorted(claims_by_target):
+        columns = sorted(claims_by_target[target], key=lambda item: item.name)
+        if target in assigned_targets or len(columns) > 1:
+            for column in columns:
+                ambiguous[column.name] = [target]
+            continue
+        column = columns[0]
+        mappings.append(FieldMapping(source=column.name, target=target, confidence=0.9))
+        assigned_targets.add(target)
+
+    mappings.sort(key=lambda item: (_normalize(item.source), item.source, item.target))
+    ambiguous = dict(sorted(ambiguous.items()))
+    unmapped.sort()
     return MappingResult(domain=domain, mappings=mappings, ambiguous=ambiguous, unmapped_columns=unmapped)
 
 
-def llm_assisted_mapping(profile: DatasetProfile, domain: DatasetDomain | str, client: Any) -> MappingResult:
-    """Use the configured LLM client only for unresolved columns, validating JSON strictly."""
+def llm_assisted_mapping(
+    profile: DatasetProfile,
+    domain: DatasetDomain | str,
+    client: Any,
+    *,
+    include_samples: bool = False,
+) -> MappingResult:
+    """Resolve remaining columns; sample values are sent only with explicit opt-in."""
     result = deterministic_mapping(profile, domain)
     if not result.unmapped_columns and not result.ambiguous:
         return result
     model = get_schema_for_domain(domain)
     candidates = sorted(model.model_fields)
     unresolved = result.unmapped_columns + list(result.ambiguous)
+    columns = [
+        column.model_dump() if include_samples else column.model_dump(exclude={"samples"})
+        for column in profile.columns
+        if column.name in unresolved
+    ]
     prompt = (
         "Map dataset columns to canonical fields. Return only JSON as "
         '{"mappings":[{"source":"...","target":"...","confidence":0.0}]}. '
         "Use only candidate targets; omit columns with no reliable match. Never infer from labels alone.\n"
-        f"Candidates: {json.dumps(candidates)}\nColumns: {json.dumps([c.model_dump() for c in profile.columns if c.name in unresolved])}"
+        f"Candidates: {json.dumps(candidates)}\nColumns: {json.dumps(columns)}"
     )
 
     def validate(content: str) -> None:
@@ -194,40 +370,151 @@ def _canonical_type(annotation: Any) -> str:
     return str(annotation).replace("<class '", "").replace("'>", "")
 
 
-def _types_compatible(source: str, target: str) -> bool:
-    source, target = source.casefold(), target.casefold()
-    if any(token in target for token in ("str", "string")):
-        return any(token in source for token in ("object", "string", "str", "category"))
-    if "bool" in target:
-        return "bool" in source or "object" in source
-    if "int" in target:
-        return any(token in source for token in ("int", "object", "string"))
-    if any(token in target for token in ("float", "decimal")):
-        return any(token in source for token in ("float", "int", "object", "string"))
-    if "datetime" in target:
-        return any(token in source for token in ("datetime", "object", "string"))
-    return True
+def _dtype_family(data_type: str) -> tuple[str, str | None] | None:
+    """Classify known pandas/Arrow dtype spellings; unknowns stay indeterminate."""
+    normalized = data_type.casefold().replace(" ", "")
+    if normalized.startswith(("list[", "list<")):
+        if normalized.startswith("list[") and normalized.endswith("]"):
+            item_type = normalized[5:-1]
+        elif "item:" in normalized and normalized.endswith(">"):
+            item_type = normalized.split("item:", 1)[1][:-1]
+        else:
+            return "collection", None
+        item_family = _dtype_family(item_type)
+        return "collection", item_family[0] if item_family else None
+    if normalized in {"str", "string", "string[python]", "string[pyarrow]"}:
+        return "string", None
+    if normalized in {"bool", "boolean"}:
+        return "boolean", None
+    if re.fullmatch(r"u?int(?:8|16|32|64|128)?", normalized):
+        return "integer", None
+    if re.fullmatch(r"(?:float|double)(?:16|32|64|128)?", normalized):
+        return "floating", None
+    if normalized.startswith(("datetime64[", "timestamp[")) or normalized in {"datetime", "datetime.datetime"}:
+        return "datetime", None
+    return None
+
+
+def _types_compatible(source: str, target: str) -> bool | None:
+    """Compare known dtype families only; this does not validate row values."""
+    source_family = _dtype_family(source)
+    target_type = target.casefold().replace(" | none", "").strip()
+    if target_type.startswith("list[") and target_type.endswith("]"):
+        target_item = _dtype_family(target_type[5:-1])
+        target_family = ("collection", target_item[0] if target_item else None)
+    else:
+        target_family = _dtype_family(target_type)
+    if source_family is None or target_family is None:
+        return None
+    if source_family[0] == "collection" and target_family[0] == "collection":
+        if source_family[1] is None or target_family[1] is None:
+            return None
+        return source_family[1] == target_family[1]
+    if source_family[0] == target_family[0]:
+        return True
+    if source_family[0] == "integer" and target_family[0] == "floating":
+        # Large integers may lose precision when converted to floating point.
+        return None
+    return False
 
 
 def compatibility_report(profile: DatasetProfile, mapping: MappingResult) -> CompatibilityReport:
+    """Compare mapped dtype families without scanning dataset values."""
     model = get_schema_for_domain(mapping.domain)
-    by_source = {column.name: column for column in profile.columns}
-    by_target = {item.target: item for item in mapping.mappings}
+    source_counts: dict[str, int] = {}
+    by_source: dict[str, ColumnProfile] = {}
+    for column in profile.columns:
+        source_counts[column.name] = source_counts.get(column.name, 0) + 1
+        by_source[column.name] = column
+
+    source_mapping_counts: dict[str, int] = {}
+    target_mapping_counts: dict[str, int] = {}
+    for item in mapping.mappings:
+        source_mapping_counts[item.source] = source_mapping_counts.get(item.source, 0) + 1
+        target_mapping_counts[item.target] = target_mapping_counts.get(item.target, 0) + 1
+
+    canonical_fields = set(model.model_fields)
+    invalid_mappings: list[MappingIssue] = []
+    valid_mappings: list[FieldMapping] = []
+    for item in mapping.mappings:
+        reasons = []
+        if source_counts.get(item.source, 0) != 1:
+            reasons.append("Source column is missing or not unique")
+        if item.target not in canonical_fields:
+            reasons.append("Target is not a canonical field for this domain")
+        if source_mapping_counts[item.source] > 1:
+            reasons.append("Source column is mapped more than once")
+        if target_mapping_counts[item.target] > 1:
+            reasons.append("Canonical target is mapped more than once")
+        if reasons:
+            invalid_mappings.append(MappingIssue(source=item.source, target=item.target, reason="; ".join(reasons)))
+        else:
+            valid_mappings.append(item)
+
     required = {name for name, field in model.model_fields.items() if field.is_required()}
-    matched, incompatible = [], []
-    for target, field_mapping in by_target.items():
+    matched, incompatible, indeterminate = [], [], []
+    valid_targets: set[str] = set()
+    for field_mapping in valid_mappings:
+        target = field_mapping.target
         source_column = by_source[field_mapping.source]
         canonical = _canonical_type(model.model_fields[target].annotation)
         compatible = _types_compatible(source_column.data_type, canonical)
-        item = FieldCompatibility(field=target, source_column=field_mapping.source, source_type=source_column.data_type, canonical_type=canonical, compatible=compatible, reason=None if compatible else "Source type may not be converted safely")
-        (matched if compatible else incompatible).append(item)
-    missing = sorted(required - set(by_target))
+        reason = (
+            None if compatible is True else
+            "Known source and canonical dtype families are incompatible" if compatible is False else
+            "Source or canonical dtype family is unknown; values were not scanned"
+        )
+        item = FieldCompatibility(field=target, source_column=field_mapping.source, source_type=source_column.data_type, canonical_type=canonical, compatible=compatible, reason=reason)
+        if compatible is True:
+            matched.append(item)
+        elif compatible is False:
+            incompatible.append(item)
+        else:
+            indeterminate.append(item)
+        valid_targets.add(target)
+    missing = sorted(required - valid_targets)
     extra = sorted(mapping.unmapped_columns + list(mapping.ambiguous))
-    return CompatibilityReport(matched=matched, missing=missing, extra=extra, incompatible=incompatible)
+    return CompatibilityReport(
+        matched=matched,
+        missing=missing,
+        extra=extra,
+        incompatible=incompatible,
+        indeterminate=indeterminate,
+        invalid_mappings=invalid_mappings,
+    )
 
 
-def map_label(source_label: str, explicit_mapping: dict[str, str]) -> LabelMapping:
-    """Apply a caller-supplied exact label map while preserving the source label."""
-    if source_label not in explicit_mapping:
-        raise ValueError(f"No explicit canonical mapping provided for label {source_label!r}")
-    return LabelMapping(source_label=source_label, canonical_label=explicit_mapping[source_label])
+def map_label(
+    source_label: str | int | float | bool | None,
+    explicit_mapping: Mapping[str | int | float | bool | None, str],
+) -> LabelMapping:
+    """Apply an exact caller-supplied label map; null and unmapped labels are errors."""
+    if source_label is None:
+        raise ValueError("Source label is null or missing")
+    if type(source_label) not in {str, int, float, bool}:
+        raise ValueError("Source label must be a string, integer, finite float, or boolean")
+    if isinstance(source_label, str) and not source_label.strip():
+        raise ValueError("Source label is blank")
+    if isinstance(source_label, float) and not math.isfinite(source_label):
+        raise ValueError("Source label float must be finite")
+    if not isinstance(explicit_mapping, Mapping):
+        raise TypeError("explicit_mapping must be a mapping")
+    if not explicit_mapping:
+        raise ValueError("explicit_mapping must contain at least one entry")
+
+    for key, value in explicit_mapping.items():
+        if key is None or type(key) not in {str, int, float, bool}:
+            raise ValueError(
+                "Mapping keys must be non-null string, integer, finite float, or boolean labels"
+            )
+        if isinstance(key, str) and not key.strip():
+            raise ValueError("Mapping keys cannot be blank")
+        if isinstance(key, float) and not math.isfinite(key):
+            raise ValueError("Mapping float keys must be finite")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Canonical label values must be non-empty strings")
+
+    for key, value in explicit_mapping.items():
+        if type(key) is type(source_label) and key == source_label:
+            return LabelMapping(source_label=source_label, canonical_label=value)
+    raise ValueError(f"No explicit canonical mapping provided for label {source_label!r}")
