@@ -56,6 +56,25 @@ def test_parse_incomplete_requirements(parser, mock_client):
     assert "target_records" in result.missing_fields
 
 
+def test_parse_incomplete_requirements_rejects_duplicate_fields(
+    parser, mock_client
+):
+    response_data = {
+        "domain": "phishing_urls",
+        "fields": [
+            {"name": "url", "required": True},
+            {"name": "URL", "required": False},
+        ],
+    }
+
+    mock_client.complete_with_fallback.return_value = SimpleNamespace(
+        content=json.dumps(response_data)
+    )
+
+    with pytest.raises(ValidationError, match="Duplicate field names"):
+        parser.parse("I need phishing URL records")
+
+
 def test_parse_invalid_json(parser, mock_client):
     mock_client.complete_with_fallback.return_value = SimpleNamespace(
         content="This is not JSON"
