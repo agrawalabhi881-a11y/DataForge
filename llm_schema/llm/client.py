@@ -106,7 +106,7 @@ class MultiProviderLLMClient:
                 if response_validator is not None:
                     try:
                         response_validator(response.content)
-                    except Exception as error:
+                    except ValueError as error:
                         raise InvalidLLMResponseError(
                             "The LLM response failed validation"
                         ) from error
