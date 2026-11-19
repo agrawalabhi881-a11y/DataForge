@@ -1,0 +1,10 @@
+﻿pandas
+polars
+numpy
+pyarrow
+pandera[pandas]
+great_expectations
+scikit-learn
+pydantic
+pytest
+openpyxl

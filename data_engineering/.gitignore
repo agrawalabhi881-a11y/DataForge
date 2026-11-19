@@ -1,0 +1,69 @@
+﻿
+# ==========================================
+# DATAFORGE - PERSON 5
+# Python and Data Engineering
+# ==========================================
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+~$*
+
+# Local data and generated outputs
+storage/raw/
+storage/processed/
+storage/synthetic/
+storage/final/
+storage/exports/
+storage/reports/
+
+# Local dataset files
+*.csv
+*.parquet
+*.feather
+*.arrow
+*.xlsx
+*.xls
+*.jsonl
+
+# Keep sample datasets when needed
+!tests/fixtures/*.csv
+!tests/fixtures/*.jsonl
+
+# Build and distribution files
+build/
+dist/
+*.egg-info/
