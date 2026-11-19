@@ -1,6 +1,6 @@
 
 """
-DataForge - Person 5
+DataForge 
 Module: JSON and JSONL Dataset Loader
 
 Loads JSON and JSONL cybersecurity datasets into Pandas

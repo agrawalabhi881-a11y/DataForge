@@ -1,6 +1,6 @@
 
 """
-DataForge - Person 5
+DataForge 
 Module: CSV Dataset Loader
 
 Loads CSV datasets and extracts basic metadata.

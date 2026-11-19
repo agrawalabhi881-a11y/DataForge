@@ -1,6 +1,6 @@
 
 """
-DataForge - Person 5
+DataForge 
 Module: Parquet Dataset Loader
 
 Load Parquet datasets, extract metadata, and stream
