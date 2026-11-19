@@ -134,3 +134,36 @@ def test_complete_returns_llm_response(monkeypatch):
     assert result.provider == LLMProvider.GEMINI
     assert result.model == "gemini-2.5-flash"
 
+def test_fallback_uses_next_provider_after_invalid_response():
+    client = MultiProviderLLMClient(create_test_settings())
+    attempted = []
+
+    def mock_complete(provider, prompt):
+        attempted.append(provider)
+
+        content = (
+            "Invalid response"
+            if provider == LLMProvider.GEMINI
+            else "Valid response"
+        )
+
+        return LLMResponse(
+            content=content,
+            provider=provider,
+            model=client.settings.providers[provider].model,
+        )
+
+    def validate_response(content):
+        if content == "Invalid response":
+            raise ValueError("Invalid structured response")
+
+    client.complete = mock_complete
+
+    result = client.complete_with_fallback(
+        "Test prompt",
+        response_validator=validate_response,
+    )
+
+    assert result.content == "Valid response"
+    assert result.provider == LLMProvider.GROQ
+    assert attempted == [LLMProvider.GEMINI, LLMProvider.GROQ]
