@@ -80,6 +80,22 @@ User request:
         except json.JSONDecodeError as error:
             raise ValueError("LLM returned invalid JSON") from error
 
+    def _validate_response(self, content: str) -> None:
+        """Validate an LLM response before accepting its provider."""
+
+        extracted_data = self._extract_json(content)
+
+        partial = PartialDatasetRequirements.model_validate(
+            extracted_data
+        )
+
+        missing = find_missing_requirements(partial)
+
+        if not missing:
+            DatasetSpecification.model_validate(
+                partial.model_dump(exclude_none=True)
+            )
+
     def parse(self, user_input: str) -> SpecificationParseResult:
         """Parse natural-language requirements into a structured result."""
 
@@ -87,7 +103,10 @@ User request:
             raise ValueError("User input cannot be empty")
 
         prompt = self._build_prompt(user_input)
-        response = self.client.complete_with_fallback(prompt)
+        response = self.client.complete_with_fallback(
+            prompt,
+            response_validator=self._validate_response,
+        )
 
         extracted_data = self._extract_json(response.content)
 

@@ -1,6 +1,7 @@
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from litellm import completion
+
 from litellm import (
     APIConnectionError,
     InternalServerError,
@@ -14,6 +15,10 @@ from llm_schema.config.provider import (
     LLMProvider,
     LLMProviderSettings,
 )
+
+
+class InvalidLLMResponseError(ValueError):
+    """Raised when an LLM response fails validation."""
 
 
 @dataclass
@@ -67,7 +72,9 @@ class MultiProviderLLMClient:
         content = response.choices[0].message.content
 
         if not isinstance(content, str) or not content.strip():
-            raise ValueError("The LLM returned an empty response")
+            raise InvalidLLMResponseError(
+                "The LLM returned an empty response"
+            )
 
         return LLMResponse(
             content=content,
@@ -75,8 +82,12 @@ class MultiProviderLLMClient:
             model=credentials.model,
         )
 
-    def complete_with_fallback(self, prompt: str) -> LLMResponse:
-        """Try configured providers in priority order."""
+    def complete_with_fallback(
+        self,
+        prompt: str,
+        response_validator: Callable[[str], None] | None = None,
+    ) -> LLMResponse:
+        """Try providers until a valid response is received."""
 
         temporary_errors = (
             RateLimitError,
@@ -90,11 +101,26 @@ class MultiProviderLLMClient:
 
         for provider in self.settings.available_providers:
             try:
-                return self.complete(provider, prompt)
+                response = self.complete(provider, prompt)
+
+                if response_validator is not None:
+                    try:
+                        response_validator(response.content)
+                    except Exception as error:
+                        raise InvalidLLMResponseError(
+                            "The LLM response failed validation"
+                        ) from error
+
+                return response
 
             except temporary_errors as error:
                 failures.append(
                     f"{provider.value}: {type(error).__name__}"
+                )
+
+            except InvalidLLMResponseError:
+                failures.append(
+                    f"{provider.value}: Invalid LLM response"
                 )
 
         if not self.settings.available_providers:
