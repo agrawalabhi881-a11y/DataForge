@@ -50,6 +50,29 @@ Add your Gemini API key to llm_schema/.env.
 - Map source columns to canonical fields.
 - Generate mapping and compatibility reports.
 
+## Individual schema mapping workflow
+
+The canonical schema registry is exposed as `get_schema_for_domain(domain)`.
+Use `inspect_dataset(path)` for CSV, JSON/JSONL, or Parquet column names,
+inferred types, nullability, and sample values. `deterministic_mapping(profile,
+domain)` applies normalized field names and domain aliases; unresolved columns
+are reported as extra or ambiguous. If an LLM client is configured,
+`llm_assisted_mapping(profile, domain, client)` asks it only about unresolved
+columns and validates the response as structured JSON against canonical fields.
+
+`compatibility_report(profile, mapping)` summarizes matched, missing required,
+extra, and type-incompatible fields. Label conversion is intentionally explicit:
+`map_label(original, mapping)` returns both the untouched source label and its
+canonical label and raises when no exact mapping was provided.
+
+The independent local example runs without credentials:
+
+    python examples/schema_mapping_demo.py
+
+To run the automated checks from the repository root:
+
+    python -m pytest -v
+
 ## Scope Boundaries
 This module does not acquire datasets, clean records,
 generate synthetic records, or decide the final data strategy.
