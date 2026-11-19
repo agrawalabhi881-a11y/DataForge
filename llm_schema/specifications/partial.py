@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from llm_schema.schemas.common import DatasetDomain
 from llm_schema.specifications.enums import DataPreference, DatasetFormat
@@ -27,3 +27,13 @@ class PartialDatasetRequirements(BaseModel):
     allow_synthetic_fallback: bool | None = None
 
     output_format: DatasetFormat | None = None
+
+    @model_validator(mode="after")
+    def validate_unique_fields(self):
+        if self.fields is not None:
+            field_names = [field.name.lower() for field in self.fields]
+
+            if len(field_names) != len(set(field_names)):
+                raise ValueError("Duplicate field names are not allowed")
+
+        return self
